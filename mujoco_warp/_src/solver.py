@@ -2449,11 +2449,30 @@ def _update_gradient_JTDAJ_dense_tiled(nv_pad: int, tile_size: int, njmax: int, 
 
 
 @wp.func
+def _elliptic_normalized_tangent(u: types.vec5, n: float) -> types.vec6:
+  # Scale before taking the norm: squaring tiny residuals can underflow even
+  # though their direction and n / norm(u) are representable.
+  scale = float(0.0)
+  for i in range(5):
+    scale = wp.max(scale, wp.abs(u[i]))
+  result = types.vec6()
+  if scale == 0.0:
+    # At the cone apex the Hessian is not unique. The zero contribution agrees
+    # with the satisfied-region choice made by the objective and gradient.
+    return result
+  scaled = u / scale
+  norm = wp.sqrt(wp.dot(scaled, scaled))
+  for i in range(5):
+    result[i] = scaled[i] / norm
+  result[5] = (n / scale) / norm
+  return result
+
+
+@wp.func
 def _elliptic_hessian_entry_from_projections(
   # In:
   dm: float,
-  mu_over_t: float,
-  mu_n_over_ttt: float,
+  mu: float,
   tangent_diag: float,
   z01: float,
   z02: float,
@@ -2461,13 +2480,9 @@ def _elliptic_hessian_entry_from_projections(
   projection2: float,
   tangent_dot: float,
 ) -> float:
-  # Contract the diagonal-plus-rank-one curvature without materializing the cone Hessian.
-  return dm * (
-    z01 * z02
-    - mu_over_t * (z01 * projection2 + z02 * projection1)
-    + mu_n_over_ttt * projection1 * projection2
-    + tangent_diag * tangent_dot
-  )
+  # Projections use the unit tangential residual. This is a rank-one term
+  # plus the orthogonal tangent projector; no independently floored T^3.
+  return dm * ((z01 - mu * projection1) * (z02 - mu * projection2) + tangent_diag * (tangent_dot - projection1 * projection2))
 
 
 @wp.kernel
@@ -2538,7 +2553,14 @@ def _update_gradient_JTCJ_dense(
     n = ctx_Jaref_in[worldid, efcid0] * mu
     z01 = mu * efc_J_in[worldid, efcid0, dof1id]
     z02 = mu * efc_J_in[worldid, efcid0, dof2id]
-    tt = float(0.0)
+    u = types.vec5()
+    for dim in range(1, condim):
+      efcid = contact_efc_address_in[conid, dim]
+      if efcid >= 0:
+        u[dim - 1] = ctx_Jaref_in[worldid, efcid] * fri[dim - 1]
+    direction = _elliptic_normalized_tangent(u, n)
+    if direction[0] == 0.0 and direction[1] == 0.0 and direction[2] == 0.0 and direction[3] == 0.0 and direction[4] == 0.0:
+      continue
     projection1 = float(0.0)
     projection2 = float(0.0)
     tangent_dot = float(0.0)
@@ -2546,22 +2568,19 @@ def _update_gradient_JTCJ_dense(
       efcid = contact_efc_address_in[conid, dim]
       if efcid >= 0:
         scale = fri[dim - 1]
-        u = ctx_Jaref_in[worldid, efcid] * scale
+        unit = direction[dim - 1]
         z1 = scale * efc_J_in[worldid, efcid, dof1id]
         z2 = scale * efc_J_in[worldid, efcid, dof2id]
-        tt += u * u
-        projection1 += u * z1
-        projection2 += u * z2
+        projection1 += unit * z1
+        projection2 += unit * z2
         tangent_dot += z1 * z2
 
-    t = wp.max(wp.sqrt(tt), types.MJ_MINVAL)
-    ttt = wp.max(t * t * t, types.MJ_MINVAL)
-    mu_tinv = math.safe_div(mu, t)
+    # The cone region has n / T <= mu; clamp only boundary roundoff.
+    tangent_diag = wp.max(mu2 - mu * direction[5], 0.0)
     h = _elliptic_hessian_entry_from_projections(
       dm,
-      mu_tinv,
-      mu * math.safe_div(n, ttt),
-      mu2 - n * mu_tinv,
+      mu,
+      tangent_diag,
       z01,
       z02,
       projection1,
@@ -2834,27 +2853,27 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int):
       n = ctx_Jaref_in[worldid, efcid0] * mu
       terms = types.vec16()
       terms[6] = mu
-      tt = float(0.0)
+      tangent = types.vec5()
       for dim in range(1, wp.static(condim)):
         if dim < block_rows:
           efcid = efcid0 + dim
           scale = fri[dim - 1]
           u = ctx_Jaref_in[worldid, efcid] * scale
-          terms[dim] = u
+          tangent[dim - 1] = u
           terms[6 + dim] = scale
-          tt += u * u
 
-      t = wp.max(wp.sqrt(tt), types.MJ_MINVAL)
-      ttt = wp.max(t * t * t, types.MJ_MINVAL)
-      mu_over_t = math.safe_div(mu, t)
-      mu_n_over_ttt = mu * math.safe_div(n, ttt)
-      tangent_diag = mu2 - n * mu_over_t
+      direction = _elliptic_normalized_tangent(tangent, n)
+      norm2 = float(0.0)
+      for dim in range(1, wp.static(condim)):
+        terms[dim] = direction[dim - 1]
+        norm2 += direction[dim - 1] * direction[dim - 1]
+      if norm2 == 0.0:
+        return types.vec16()
 
-      # Layout: tangent u[1:6], scales[6:12], dm, mu/t, mu*n/t^3, tangent diagonal.
+      # Layout: unit tangent[1:6], scales[6:12], dm, mu, unused, tangent diagonal.
       terms[12] = dm
-      terms[13] = mu_over_t
-      terms[14] = mu_n_over_ttt
-      terms[15] = tangent_diag
+      terms[13] = mu
+      terms[15] = wp.max(mu2 - mu * direction[5], 0.0)
       return terms
 
     return func
@@ -2886,7 +2905,6 @@ def _JTDACJ_sparse(compact: bool, cone_type: types.ConeType, max_condim: int):
       return _elliptic_hessian_entry_from_projections(
         terms[12],
         terms[13],
-        terms[14],
         terms[15],
         z01,
         z02,

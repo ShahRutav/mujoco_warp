@@ -84,8 +84,10 @@ def _elliptic_dense_hessian_reference(m, d, ctx):
         u[dim] = jaref[worldid, efcid] * scale[dim]
       jac[dim] = efc_J[worldid, efcid, : m.nv]
 
-    t = max(np.linalg.norm(u[1:]), types.MJ_MINVAL)
-    ttt = max(t * t * t, types.MJ_MINVAL)
+    t = np.linalg.norm(u[1:])
+    if t == 0.0:
+      continue
+    ttt = t * t * t
     cone = np.zeros((condim, condim))
     for dim1 in range(condim):
       for dim2 in range(dim1 + 1):
@@ -152,8 +154,10 @@ def _elliptic_sparse_hessian_reference(m, d, ctx):
       cols = efc_J_colind[worldid, 0, rowadr : rowadr + rownnz]
       jac[dim, cols] = efc_J[worldid, 0, rowadr : rowadr + rownnz]
 
-    t = max(np.linalg.norm(u[1:]), types.MJ_MINVAL)
-    ttt = max(t * t * t, types.MJ_MINVAL)
+    t = np.linalg.norm(u[1:])
+    if t == 0.0:
+      continue
+    ttt = t * t * t
     cone = np.zeros((condim, condim))
     for dim1 in range(condim):
       for dim2 in range(dim1 + 1):
@@ -810,6 +814,70 @@ class SolverTest(parameterized.TestCase):
     qacc = d.qacc.numpy()[0]
     self.assertTrue(np.all(np.isfinite(qacc)), "Newton solve produced non-finite qacc")
     _assert_eq(qacc, mjd.qacc, "qacc")
+
+  @parameterized.parameters("dense", "sparse")
+  def test_elliptic_hessian_small_residual(self, jacobian):
+    """Cone curvature is scale invariant, including below the old cubed-norm floor."""
+    bodies = "".join(
+      f'<body pos="{i * 0.25} 0 .02"><freejoint/><geom type="box" size=".04 .05 .03" mass=".5" condim="{dim}"/></body>'
+      for i, dim in enumerate((3, 4, 6))
+    )
+    mjm, mjd, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco><option cone="elliptic" solver="Newton" jacobian="{jacobian}" impratio="20"/>
+      <worldbody><geom type="plane" size="5 5 .1" friction=".95 .013 .002"/>{bodies}</worldbody></mujoco>
+    """
+    )
+    ctx = solver._create_solver_context(m, d)
+    solver.init_context(m, d, ctx, grad=True)
+    address = d.contact.efc_address.numpy()
+    friction = d.contact.friction.numpy()
+    dimensions = d.contact.dim.numpy()
+    ncontact = int(d.nacon.numpy()[0])
+    states = d.efc.state.numpy()
+    mass = np.zeros((m.nv, m.nv))
+    mujoco.mj_fullM(mjm, mjd, mass)
+    rng = np.random.default_rng(17)
+    directions = [rng.normal(size=int(dim) - 1) for dim in dimensions[:ncontact]]
+    for direction in directions:
+      direction /= np.linalg.norm(direction)
+    reference_fn = _elliptic_sparse_hessian_reference if m.is_sparse else _elliptic_dense_hessian_reference
+    for magnitude in (0.0, 1e-30, 1e-16, 1e-8, 1.2329276e-6, 1e-5, 2e-5, 1.0):
+      for fraction in (-0.999, 0.0, 0.1873, 0.999, 1.0):
+        residual = np.zeros(ctx.Jaref.shape, dtype=np.float32)
+        for c in range(ncontact):
+          ids = address[c]
+          mu = float(friction[c, 0]) / np.sqrt(20.0)
+          ratio = fraction * mu if fraction >= 0 else fraction / mu
+          residual[0, ids[0]] = ratio * magnitude / mu
+          for j in range(1, int(dimensions[c])):
+            residual[0, ids[j]] = magnitude * directions[c][j - 1] / friction[c, j - 1]
+          states[0, ids[0] : ids[0] + dimensions[c]] = types.ConstraintState.CONE.value
+        ctx.Jaref.assign(residual)
+        d.efc.state.assign(states)
+        ctx.done.fill_(False)
+        solver._update_gradient(m, d, ctx)
+        actual = ctx.h.numpy()[0, : m.nv, : m.nv]
+        expected = np.triu(mass) + reference_fn(m, d, ctx)[0]
+        np.testing.assert_allclose(np.triu(actual), expected, rtol=2e-5, atol=2e-5)
+        symmetric = np.triu(actual) + np.triu(actual, 1).T
+        self.assertTrue(np.isfinite(symmetric).all())
+        self.assertGreater(np.linalg.eigvalsh(symmetric).min(), 0.0)
+
+        # Also take the objective/gradient's actual region choice. At tiny
+        # magnitudes its squared norm may underflow; a non-cone state must not
+        # accidentally receive our normalized cone curvature.
+        solver._update_constraint(m, d, ctx)
+        solver._update_gradient(m, d, ctx)
+        actual = ctx.h.numpy()[0, : m.nv, : m.nv]
+        symmetric = np.triu(actual) + np.triu(actual, 1).T
+        self.assertTrue(np.isfinite(ctx.grad.numpy()).all())
+        self.assertTrue(np.isfinite(ctx.search.numpy()).all())
+        self.assertGreater(np.linalg.eigvalsh(symmetric).min(), 0.0)
+        if magnitude == 0.0:
+          for c in range(ncontact):
+            self.assertEqual(d.efc.state.numpy()[0, address[c, 0]], types.ConstraintState.SATISFIED)
+          np.testing.assert_allclose(symmetric, mass, rtol=1e-5, atol=1e-7)
 
   def test_elliptic_dense_hessian(self):
     """Structured dense cone contraction matches the reference Hessian."""
